@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Checkpoints (large model files ~100MB each)
+checkpoints/*.pt
+checkpoints/meta.npy
+checkpoints/logs/
+checkpoints_backup/
+
+# Keep the best model via Git LFS or manual upload
+# !checkpoints/pacman_s5_ep3550.pt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/
