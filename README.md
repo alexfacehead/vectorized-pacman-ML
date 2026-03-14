@@ -2,6 +2,8 @@
 
 A Deep Q-Network agent that learns to play Pac-Man through curriculum learning, trained on a custom vectorized engine that runs 128 games simultaneously.
 
+Inspired by [DeepMind's original DQN work](https://www.nature.com/articles/nature14236) on Atari games. Pac-Man is a notoriously difficult RL problem — unlike most Atari games, it requires long-horizon planning, multi-agent evasion (ghosts use distinct AI strategies), and precise navigation through a maze with no margin for error. Ms. Pac-Man was famously one of the last Atari games to be "solved" by deep RL agents, and remains a benchmark for the field.
+
 <p align="center">
   <img src="assets/pacman-dqn-demo.gif" alt="Pac-Man DQN agent playing against 2 ghosts at Stage 4" width="400">
   <br>
@@ -158,6 +160,12 @@ The single-env engine plateaued at 38% win rate after 450 episodes. The vectoriz
 
 ### Phase 5: Curriculum Scaling
 Progressive difficulty stages with epsilon resets proved essential. Each new ghost introduces fundamentally different spatial dynamics that require fresh exploration.
+
+### Open Question: Removing the No-Reverse Mask
+
+The proximity-based no-reverse action mask is the most impactful component of our anti-oscillation system — but it's a hard constraint on the agent's action space, not a learned behavior. Ideally, the agent would learn *on its own* not to oscillate, without needing the mask as a crutch.
+
+This is an open problem we plan to investigate once the agent is strong enough against all 4 ghosts. The question is whether a sufficiently trained agent can maintain performance if the mask is gradually relaxed or removed entirely — or whether DQN fundamentally needs this constraint in tile-based environments where Q-values for opposing directions converge.
 
 ## Setup
 
