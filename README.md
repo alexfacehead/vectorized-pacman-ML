@@ -1,33 +1,55 @@
-# Vectorized Pac-Man DQN
+# Vectorized Pac-Man DRQN
 
-A Deep Q-Network agent that learns to play Pac-Man through curriculum learning, trained on a custom vectorized engine that runs 128 games simultaneously.
+A Dueling Deep Recurrent Q-Network agent that learns to play Pac-Man through curriculum learning, trained on a custom vectorized engine that runs 128 games simultaneously on a single MacBook.
 
-Inspired by [DeepMind's original DQN work](https://www.nature.com/articles/nature14236) on Atari games. Pac-Man is a notoriously difficult RL problem — unlike most Atari games, it requires long-horizon planning, multi-agent evasion (ghosts use distinct AI strategies), and precise navigation through a maze with no margin for error. Ms. Pac-Man was famously one of the last Atari games to be "solved" by deep RL agents, and remains a benchmark for the field.
+Inspired by [DeepMind's original DQN work](https://www.nature.com/articles/nature14236) on Atari games. Unlike DeepMind's approach (raw pixel input, reward clipping, no domain knowledge), this project uses structured semantic state channels and carefully shaped rewards — trading generality for sample efficiency and trainability on consumer hardware. The agent learns maze navigation, pellet collection, ghost evasion, and multi-ghost strategy entirely through reinforcement learning with no hardcoded pathfinding.
 
 <p align="center">
-  <img src="assets/pacman-dqn-demo.gif" alt="Pac-Man DQN agent playing against 2 ghosts at Stage 4" width="400">
+  <img src="assets/pacman-dqn-demo.gif" alt="DRQN agent playing Pac-Man against 4 ghosts" width="400">
   <br>
-  <em>DQN agent vs. 2 ghosts (Blinky + Pinky) at half speed — 75% average win rate after ~230,000 games of curriculum training. The agent learned maze navigation, pellet collection, and multi-ghost evasion entirely through reinforcement learning.</em>
+  <em>DRQN agent vs. 4 ghosts (all at half speed) — 77.7% win rate evaluated over 2,048 games at greedy policy (epsilon = 0). Trained in ~205,000 games across a 6-stage curriculum on Apple Silicon.</em>
 </p>
 
 ## Results
 
-| Stage | Ghosts | Ghost Speed | Games Trained | Peak Win Rate | Peak 5-ep Avg |
-|-------|--------|-------------|---------------|---------------|---------------|
-| 1 — Maze mastery | None | — | 3,200 | 100% | 100% |
-| 2 — One ghost | Blinky | 50% of Pac-Man | 51,200 | 59% | ~55% |
-| 3 — Two ghosts | Blinky + Pinky | 50% of Pac-Man | 160,000 | 81% | 75% |
-| 4 — Three ghosts | Blinky + Pinky + Inky | 50% of Pac-Man | In progress | ~49% | ~41% |
+All eval win rates measured at epsilon = 0 (pure greedy policy) over 512+ games unless noted.
 
-**Total games trained: 230,000+** (and counting)
+| Stage | Ghosts | Ghost Speed | Episodes | Eval Win Rate |
+|-------|--------|-------------|----------|---------------|
+| 1 | None | -- | 225 | 100% |
+| 2 | Blinky | 50% | 150 | 90%+ |
+| 5 | Blinky + Pinky + Inky | 50% | 428 | 83% |
+| 6 | All 4 ghosts | 50% | 800 | **77.7%** (n=2048) |
+
+**Total: ~1,600 episodes / ~205,000 games.** Each episode = 128 parallel games.
+
+### Key Milestone: No-Reverse Mask Removed
+
+The DRQN with LSTM is the first architecture in this project to succeed without the anti-oscillation reverse mask. Previous DQN architectures required hard-masking the reverse direction to prevent pathological oscillation. The LSTM's temporal memory handles this naturally -- the agent remembers "I was just going left" and commits to directions without explicit action-space constraints. Oscillation is near-zero under greedy play; minor stuttering occurs only in genuinely ambiguous multi-ghost situations.
+
+### Previous Architecture (DQN) Comparison
+
+The flat DQN (no LSTM) achieved ~70% against 1 ghost but collapsed to 40-50% against 3 ghosts. The DRQN surpassed this ceiling within 120 episodes of Stage 5 training, demonstrating that temporal reasoning is essential for multi-ghost evasion.
 
 ## Architecture
 
-**Double DQN** with experience replay and a target network.
+**Dueling DRQN (Double DQN + LSTM)** with episode-based sequence replay and a target network.
 
-**Model:** 3-layer CNN (32 → 64 → 64 filters) followed by fully-connected layers (512 → 256 → 4 actions). ~6.5M parameters.
+**Model:** 3-layer CNN (32 -> 64 -> 128 filters, stride-2 on layer 3) -> FC (24,960 -> 512) -> LSTM (512 hidden) -> Dueling heads (value stream + advantage stream). ~13M parameters.
 
-**State representation:** 7-channel tensor (7 × 31 × 28):
+```
+Input (9, 31, 28) -> Conv 3x3 (32) -> Conv 3x3 (64) -> Conv 3x3 stride-2 (128)
+  -> Flatten (24,960) -> FC (512) -> LSTM (512)
+  -> Value:     FC 512->256->1
+  -> Advantage: FC 512->256->4
+  -> Q = V + (A - mean(A))
+```
+
+The LSTM supports two modes:
+- **Single-step inference** (gameplay): processes one frame at a time, maintaining hidden state across steps
+- **Sequence mode** (training): unrolls full sequences for BPTT, enabling temporal credit assignment
+
+**State representation:** 9-channel tensor (9 x 31 x 28) with per-ghost channels:
 
 | Channel | Contents |
 |---------|----------|
@@ -35,68 +57,68 @@ Inspired by [DeepMind's original DQN work](https://www.nature.com/articles/natur
 | 1 | Pellets |
 | 2 | Power pellets |
 | 3 | Pac-Man position |
-| 4 | Ghost positions (non-frightened) |
-| 5 | Frightened ghost positions |
-| 6 | Visit heatmap (decaying) |
+| 4 | Blinky (1.0 = dangerous, -1.0 = frightened, 0.0 = absent) |
+| 5 | Pinky |
+| 6 | Inky |
+| 7 | Clyde |
+| 8 | Visit heatmap (decaying) |
 
-**Split CPU/GPU architecture:** The game engine runs on CPU using PyTorch tensors for vectorized integer operations (14x faster than MPS for this workload). Only the neural network forward/backward passes run on GPU (MPS on Apple Silicon, or CUDA).
+Per-ghost channels (vs. a single shared ghost channel) enable the LSTM to learn ghost-specific behaviors and track each ghost's trajectory independently. When transitioning between curriculum stages, trained ghost channels transfer cleanly while new channels converge from near-random initialization.
+
+**Split CPU/GPU architecture:** The game engine runs on CPU using PyTorch tensors for vectorized integer operations (faster than GPU for small integer ops). Only the neural network forward/backward passes run on GPU (MPS on Apple Silicon, or CUDA).
 
 ## How It Works
 
 ### Vectorized Engine
 
-Instead of training on one game at a time (~180 steps/sec), the engine runs **128 games simultaneously** using batched tensor operations. Each game step produces 128 transitions for the replay buffer, yielding **~6,000 env-steps/sec** — a 30x throughput increase.
+Instead of training on one game at a time, the engine runs **128 games simultaneously** using batched tensor operations. Each game step produces 128 transitions, yielding ~2,800 env-steps/sec throughput.
+
+### Sequence Replay Buffer
+
+Unlike flat DQN replay buffers that store individual transitions, the DRQN uses an episode-based buffer. Complete episode trajectories are stored and fixed-length sequences (default 32 steps) are sampled for LSTM training via BPTT. This preserves temporal coherence that random single-transition sampling would destroy.
 
 ### Curriculum Learning
 
-The agent progresses through stages of increasing difficulty. Each stage builds on the previous checkpoint:
+The agent progresses through stages of increasing difficulty, with each stage building on the previous checkpoint:
 
 ```bash
 # Stage 1: Learn the maze (no ghosts)
-python -m training.train --n-envs 128 --stage 1 --episodes 50
+python -m training.train --n-envs 128 --stage 1 --episodes 225 --allow-reverse
 
 # Stage 2: One ghost (Blinky, half speed)
-python -m training.train --n-envs 128 --stage 2 --episodes 800 --resume --eps-start 0.20
+python -m training.train --n-envs 128 --stage 2 --episodes 200 --eps-start 0.5 --allow-reverse --resume
 
-# Stage 3: Two ghosts (Blinky + Pinky, half speed)
-python -m training.train --n-envs 128 --stage 4 --episodes 2500 --resume --eps-start 0.20
+# Stage 5: Three ghosts (Blinky + Pinky + Inky, half speed)
+python -m training.train --n-envs 128 --stage 5 --episodes 500 --eps-start 0.5 --allow-reverse --resume
 
-# Stage 4: Three ghosts (Blinky + Pinky + Inky, half speed)
-python -m training.train --n-envs 128 --stage 5 --episodes 1000 --resume --eps-start 0.20
+# Stage 6: Four ghosts (all, half speed)
+python -m training.train --n-envs 128 --stage 6 --episodes 800 --eps-start 0.25 --allow-reverse --resume
 ```
 
-Each new stage resets epsilon to 0.20 to allow exploration of new ghost-avoidance strategies. Without this reset, the agent grinds on a frozen policy that doesn't account for the new threat.
+Each new stage resets epsilon to allow exploration of new ghost-avoidance strategies. The LSTM architecture means higher starting epsilon is tolerable -- the diverse experiences fill the replay buffer with novel multi-ghost configurations needed for learning, even though high epsilon degrades in-episode LSTM context.
 
-### Ghost Speed System
+**Stage transition insight:** When adding new ghosts, the corresponding input channels start with near-random weights since they were always zero during previous training. The agent initially ignores (or walks into) new ghosts, but converges quickly because the existing ghost-evasion features on trained channels transfer. Stage 6 (4th ghost) ramped from 9% to 65% in ~100 episodes.
 
-Ghosts use an integer timer: `speed=2` means the ghost moves every 2nd tick (50% of Pac-Man's speed). In the original Pac-Man, ghosts move at ~75-80% of Pac-Man's speed on level 1. Our `speed=2` is slightly easier than the original, which works well for curriculum learning.
+### Ghost Proximity: BFS Distance
 
-### Anti-Oscillation System
-
-DQN agents in grid worlds are prone to oscillation — rapidly alternating directions instead of making progress. We solved this with three components:
-
-**1. Proximity-based no-reverse masking:** Block the reverse of Pac-Man's current direction *unless* a ghost is within Manhattan distance 4. This prevents oscillation ~90% of the time while allowing emergency fleeing.
-
-**2. Direction-change penalty (-0.03):** Makes rapid direction changes expensive in Q-value space.
-
-**3. Visit penalty (decaying heatmap):** Penalizes revisiting tiles. Coefficient is 0.30 with no ghosts, 0.15 with ghosts (so legitimate evasion isn't over-penalized).
+Ghost proximity penalties use precomputed Floyd-Warshall BFS distances rather than Manhattan distance. This prevents "phantom fear" where the agent avoids ghosts that are nearby in straight-line distance but unreachable behind walls. The BFS distance matrix is computed once from the maze layout and reused every step.
 
 ### Reward Structure
 
 | Signal | Value | Notes |
 |--------|-------|-------|
 | Per-step penalty | -0.05 | Time pressure |
-| Visit penalty | -(0.15 or 0.30) × heatmap | 0.30 no ghosts, 0.15 with ghosts |
+| Visit penalty | -(0.15 or 0.30) x heatmap | 0.30 no ghosts, 0.15 with ghosts |
 | Direction change | -0.03 | When action differs from previous |
-| Pellet eaten | +1.0 + 2.0 × progress | progress = pellets_eaten / total |
-| Power pellet | +2.0 + 2.0 × progress | Same progress formula |
-| BFS proximity | +/-(0.1 to 0.3) × delta | Scaled up in endgame |
-| Ghost proximity | -0.075 × (5 - dist) | Non-house ghosts within Manhattan dist 4 |
-| Ghost eaten | +0.5 × combo | Combo resets on power-up expiry |
+| Pellet eaten | +1.0 + 2.0 x progress | progress = pellets_eaten / total |
+| Power pellet | +2.0 + 2.0 x progress | Same progress scaling |
+| BFS proximity reward | +/-(0.1 to 0.3) x delta | Reward for moving toward nearest pellet |
+| Ghost proximity penalty | -0.075 x (5 - dist) | BFS dist <= 4, non-house non-frightened ghosts |
+| Ghost eaten | +0.5 x combo | Combo resets on power-up expiry |
 | Death | -5.0 | 1 life = game over |
 | Level complete | +5.0 + time_bonus | Time bonus up to +5.0 |
 
-**Reward clipping was intentionally removed.** The original DQN paper clips rewards to [-1, 1], but this destroyed signal differentiation in our case — death (-5.0) clipped to -1.0 was barely worse than a revisit penalty (-0.5). Removing clipping was critical for learning ghost avoidance.
+**Reward clipping was intentionally removed.** The original DQN paper clips rewards to [-1, 1], but this destroyed signal differentiation -- death (-5.0) clipped to -1.0 was barely worse than a revisit penalty. Removing clipping was critical for learning ghost avoidance.
 
 ## Hyperparameters
 
@@ -104,12 +126,15 @@ DQN agents in grid worlds are prone to oscillation — rapidly alternating direc
 |-----------|-------|
 | Learning rate | 0.0001 (Adam) |
 | Gamma | 0.99 |
-| Epsilon | 0.20 → 0.01, decay 0.99997/step |
-| Replay buffer | 200,000–500,000 transitions |
-| Batch size | 64 |
+| Epsilon decay | 0.99997 per env step |
+| Epsilon floor | 0.05 |
+| Replay buffer | 200,000 transitions (episode-based) |
+| Batch size | 32 |
+| Sequence length | 32 (LSTM unroll for BPTT) |
 | Train every | 4 game steps |
-| Target network update | Every 10,000 steps |
+| Target network update | Every 5,000 steps |
 | Max steps/episode | 3,500 |
+| Grad clip | max_norm 10.0 |
 
 ## Project Structure
 
@@ -118,54 +143,65 @@ vectorized-pacman-ML/
 ├── engine/              # Vectorized game engine (batched PyTorch tensors)
 │   ├── batched_game.py  # Core: N-env game loop, stage config, rewards
 │   ├── ghosts.py        # Ghost AI (classic Pac-Man algorithms, not ML)
-│   ├── maze.py          # Maze parsing and wall logic
-│   ├── action_mask.py   # Anti-oscillation reverse masking
-│   ├── rewards.py       # Reward computation
-│   └── ...
+│   ├── maze.py          # Maze parsing, wall logic, BFS distance matrix
+│   ├── action_mask.py   # Action masking (reverse mask, optional)
+│   ├── rewards.py       # Reward computation (BFS proximity, ghost penalty)
+│   └── constants.py     # State channels, ghost configs
 ├── models/
-│   └── pacman_model.py  # Double DQN (3-layer CNN + FC)
+│   └── pacman_model.py  # Dueling DRQN (CNN + LSTM + Dueling heads)
 ├── training/
-│   └── train.py         # Training loop with CSV logging
+│   └── train.py         # Training loop with CSV logging, checkpointing
 ├── utils/
-│   └── replay_buffer.py # Experience replay buffer
-├── tests/               # 8 test phases covering movement → training
+│   └── replay_buffer.py # Episode-based sequence replay buffer
 ├── levels/
 │   └── level_1.txt      # Maze layout
 ├── watch.py             # Watch trained agent play (uses PacmanML renderer)
-└── checkpoints/         # Saved models and training logs
+├── eval.py              # Headless evaluation (configurable epsilon, game count)
+└── checkpoints/         # Saved models (~233MB each) and training logs
     └── logs/            # Per-episode CSV logs
 ```
 
 ## Watching the Agent Play
 
 ```bash
-python watch.py --model checkpoints/pacman_agent.pt --stage 5
+# Watch the agent play against 4 ghosts
+python watch.py --model checkpoints/pacman_agent.pt --stage 6
+
+# Headless evaluation (2048 games, pure greedy)
+python eval.py --model checkpoints/pacman_agent.pt --stage 6 --games 2048 --epsilon 0
 ```
 
-Requires the [PacmanML](https://github.com/alexhugli/PacmanML) renderer installed alongside this project.
+Requires the [PacmanML](https://github.com/alexhugli/PacmanML) renderer installed alongside this project for `watch.py`.
 
 ## Research Journey
 
-### Phase 1: Single-Environment Training
-Started with a Pygame-based engine running one game at a time (~180 steps/sec). Stage 1 (no ghosts) worked immediately. Stage 2 (one ghost) broke everything due to oscillation.
+### Dead Ends
 
-### Phase 2: The Oscillation Crisis
-The agent would rapidly alternate left-right instead of progressing. Standard fixes from Atari DQN literature (sticky actions, frame skip) failed — tile-based games need per-tile decisions. The anti-oscillation system described above was the solution.
+- **Reward clipping** (following Atari DQN paper): destroyed reward differentiation. Removing it was the single biggest early improvement.
+- **Flat DQN for multi-ghost**: hit a hard ceiling at 40-50% against 3 ghosts. No amount of reward tuning or training volume could overcome the lack of temporal memory.
+- **No-reverse mask with DQN**: required as a crutch to prevent pathological oscillation. Worked, but constrained the action space artificially.
+- **Manhattan distance for ghost proximity**: caused phantom penalties through walls, teaching the agent to fear ghosts in adjacent corridors it couldn't reach. Replaced with BFS distance.
+- **Sequence length 16 with 4 ghosts**: adequate for 1-3 ghosts, but 4 ghosts cover enough of the maze that longer planning horizons (seq_len 32) were needed to anticipate traps.
 
-### Phase 3: Reward Engineering
-Reward clipping (following the original DQN paper) was silently destroying training. Removing it was the single biggest improvement for ghost avoidance learning.
+### Breakthroughs
 
-### Phase 4: Vectorization (30x Speedup)
-The single-env engine plateaued at 38% win rate after 450 episodes. The vectorized engine provided the training volume needed to break through, reaching 59% on Stage 2 and eventually 81% peak on Stage 3 (two ghosts).
+1. **Vectorized engine** (128 parallel games): provided the training volume needed to learn non-trivial strategies. Single-env training plateaued at ~38% on one ghost.
+2. **DRQN with LSTM**: enabled temporal reasoning, eliminating the need for the reverse mask and breaking through the DQN's multi-ghost ceiling. The LSTM's hidden state provides implicit memory of ghost trajectories and movement history.
+3. **Per-ghost state channels**: allowed the network to learn ghost-specific evasion strategies and enabled clean weight transfer during curriculum transitions.
+4. **BFS ghost proximity**: accurate distance signal through maze topology, replacing misleading Manhattan distance.
+5. **Curriculum learning with epsilon resets**: each stage inherits a strong prior from the previous stage, requiring only moderate exploration to adapt to new threats.
 
-### Phase 5: Curriculum Scaling
-Progressive difficulty stages with epsilon resets proved essential. Each new ghost introduces fundamentally different spatial dynamics that require fresh exploration.
+### LSTM Phase Transition
 
-### Open Question: Removing the No-Reverse Mask
+A distinctive pattern emerged across all stages: the LSTM exhibits a "phase transition" where performance suddenly accelerates as epsilon drops. At high epsilon, random actions corrupt the LSTM's hidden state, preventing coherent temporal reasoning. As epsilon falls below ~0.15, the agent gets enough consecutive coherent actions for the hidden state to build meaningful context, creating a feedback loop: cleaner sequences -> better temporal reasoning -> better Q-values -> even better sequences.
 
-The proximity-based no-reverse action mask is the most impactful component of our anti-oscillation system — but it's a hard constraint on the agent's action space, not a learned behavior. Ideally, the agent would learn *on its own* not to oscillate, without needing the mask as a crutch.
+Stage 5 (3 ghosts) progression: 0% (ep 376) -> 6% (ep 480) -> 27% (ep 525) -> 51% (ep 575) -> 83% eval (ep 800).
 
-This is an open problem we plan to investigate once the agent is strong enough against all 4 ghosts. The question is whether a sufficiently trained agent can maintain performance if the mask is gradually relaxed or removed entirely — or whether DQN fundamentally needs this constraint in tile-based environments where Q-values for opposing directions converge.
+## Future Work
+
+- **Fractional ghost speeds**: replace integer speed timer with accumulator system to match original arcade ghost speeds (75-95% of Pac-Man's speed depending on level)
+- **Multiple maze layouts**: forced generalization to prove the agent isn't memorizing a single maze
+- **Adversarial ghost training**: self-play where a second DRQN controls the ghosts, bootstrapped from the trained Pac-Man agent
 
 ## Setup
 
@@ -178,7 +214,7 @@ cd vectorized-pacman-ML
 pip install -r requirements.txt
 
 # Train from scratch
-python -m training.train --n-envs 128 --stage 1 --episodes 50
+python -m training.train --n-envs 128 --stage 1 --episodes 225 --allow-reverse
 
 # Run tests
 pytest tests/

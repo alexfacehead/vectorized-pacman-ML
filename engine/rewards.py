@@ -167,8 +167,13 @@ def ghost_proximity_penalty(
     active: torch.Tensor,
     game_over: torch.Tensor,
     level_complete: torch.Tensor,
+    dist_matrix: torch.Tensor,
+    tile_to_idx: torch.Tensor,
 ) -> torch.Tensor:
     """Penalize Pacman for being near non-frightened ghosts.
+
+    Uses BFS (precomputed Floyd-Warshall) distance instead of Manhattan,
+    so ghosts behind walls don't trigger phantom penalties.
 
     Args:
         pacman_pos: (N, 2) int.
@@ -179,6 +184,8 @@ def ghost_proximity_penalty(
         active: (N,) bool.
         game_over: (N,) bool.
         level_complete: (N,) bool.
+        dist_matrix: (num_tiles, num_tiles) int16 — precomputed distances.
+        tile_to_idx: (ROWS, COLS) int32 — grid position to tile index.
 
     Returns:
         penalty: (N,) float — negative values.
@@ -191,16 +198,29 @@ def ghost_proximity_penalty(
     if skip.all():
         return penalty
 
-    # Manhattan distance to each ghost: (N, 4)
-    pac_expanded = pacman_pos.unsqueeze(1)  # (N, 1, 2)
-    dist = (pac_expanded - ghost_pos).abs().sum(dim=2)  # (N, 4)
+    # Get tile indices for Pacman: (N,)
+    px = pacman_pos[:, 0].long()
+    py = pacman_pos[:, 1].long()
+    pac_tile = tile_to_idx[py, px].long()  # (N,)
+
+    # BFS distance to each ghost: (N, 4)
+    dist = torch.zeros(N, 4, dtype=torch.float32, device=device)
+    for gi in range(4):
+        gx = ghost_pos[:, gi, 0].long()
+        gy = ghost_pos[:, gi, 1].long()
+        ghost_tile = tile_to_idx[gy, gx].long()  # (N,)
+        # Lookup precomputed BFS distance
+        tile_dist = dist_matrix[pac_tile, ghost_tile].float()  # (N,)
+        # Ghosts in house may be on tiles not in dist_matrix (-1 index);
+        # those get excluded anyway, so clamp to safe value
+        dist[:, gi] = torch.where(ghost_tile >= 0, tile_dist, torch.tensor(9999.0, device=device))
 
     # Exclude ghosts in house, frightened, or eaten
     excluded = ghost_in_house | ghost_is_frightened | ghost_is_eaten  # (N, 4)
 
-    # Penalty for ghosts within distance 4
+    # Penalty for ghosts within BFS distance 4
     close = (dist <= 4) & ~excluded  # (N, 4)
-    per_ghost_penalty = -0.075 * (5 - dist.float())  # (N, 4)
+    per_ghost_penalty = -0.075 * (5 - dist)  # (N, 4)
     per_ghost_penalty = torch.where(close, per_ghost_penalty, torch.zeros_like(per_ghost_penalty))
 
     # Sum across ghosts

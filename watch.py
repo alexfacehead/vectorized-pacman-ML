@@ -191,6 +191,11 @@ def run_visual(args):
         agent.epsilon = 0.01  # tiny noise to avoid wall-staring
         print(f"Loaded model from {args.model} (epsilon={agent.epsilon:.2f})")
 
+    # LSTM hidden state for DRQN agent
+    hidden = None
+    if agent is not None:
+        hidden = agent.init_hidden(1)
+
     if args.ghosts:
         for i in range(4):
             batched.ghost_exit_timer[0, i] = i * 300  # Staggered exits
@@ -245,6 +250,8 @@ def run_visual(args):
                     level_adapter = LevelAdapter(orig_level, batched, 0)
                     if orig_game:
                         orig_game.reset()
+                    if agent is not None:
+                        hidden = agent.init_hidden(1)
                     step_count = 0
                 elif event.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
                     playback_fps = min(60, playback_fps + 5)
@@ -274,7 +281,7 @@ def run_visual(args):
         elif agent is not None:
             state = batched.get_state()
             action_mask = batched.get_action_mask(no_reverse=True)
-            actions = agent.select_actions_batched(state, action_mask)
+            actions, hidden = agent.select_actions_batched(state, action_mask, hidden)
             action = actions[0].item()
         else:
             action = np.random.randint(0, 4)

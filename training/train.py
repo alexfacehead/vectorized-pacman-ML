@@ -1,8 +1,9 @@
-"""Batched DQN training for Pacman using the vectorized engine.
+"""Batched DRQN training for Pacman using the vectorized engine.
 
 Runs N environments simultaneously. Each game step produces N transitions,
-giving an N× throughput boost for replay buffer filling. The neural network
-forward pass is batched across all N environments for action selection.
+giving an N× throughput boost. The neural network uses an LSTM for temporal
+reasoning — the agent can learn multi-step strategies, ghost tracking, and
+route planning instead of purely reactive play.
 
 Usage:
     python -m training.train                        # 16 envs, 5000 episodes
@@ -22,12 +23,13 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 
 from engine.batched_game import BatchedGame
 from engine.constants import MAX_STEPS, NUM_STATE_CHANNELS
-from models.pacman_model import PacmanDQN
-from utils.replay_buffer import ReplayBuffer
+from models.pacman_model import PacmanDRQN
+from utils.replay_buffer import SequenceReplayBuffer
 
 
 def _auto_device() -> torch.device:
@@ -48,24 +50,26 @@ def _fmt_time(seconds: float) -> str:
 
 
 class BatchedPacmanAgent:
-    """DQN agent adapted for batched (N-env) training.
+    """DRQN agent for batched (N-env) training.
 
-    Uses Double-DQN with a target network and epsilon-greedy exploration.
-    Action selection is batched: one forward pass for all N environments.
+    Uses Double-DQN with a target network, epsilon-greedy exploration,
+    and an LSTM for temporal reasoning. Action selection always runs a
+    forward pass on all N environments to keep LSTM hidden states current.
     """
 
     def __init__(
         self,
-        in_channels: int = 7,
+        in_channels: int = 9,
         num_actions: int = 4,
         lr: float = 0.0001,
         gamma: float = 0.99,
         epsilon_start: float = 1.0,
         epsilon_end: float = 0.05,
         epsilon_decay: float = 0.9995,
-        buffer_size: int = 100_000,
-        batch_size: int = 64,
-        target_update_freq: int = 1000,
+        buffer_size: int = 200_000,
+        batch_size: int = 32,
+        seq_len: int = 16,
+        target_update_freq: int = 5000,
         device: str = "auto",
     ):
         if device == "auto":
@@ -76,103 +80,109 @@ class BatchedPacmanAgent:
         self.num_actions = num_actions
         self.gamma = gamma
         self.batch_size = batch_size
+        self.seq_len = seq_len
         self.target_update_freq = target_update_freq
 
         self.epsilon = epsilon_start
         self.epsilon_end = epsilon_end
         self.epsilon_decay = epsilon_decay
 
-        self.model = PacmanDQN(in_channels, num_actions).to(self.device)
-        self.target_model = PacmanDQN(in_channels, num_actions).to(self.device)
+        self.model = PacmanDRQN(in_channels, num_actions).to(self.device)
+        self.target_model = PacmanDRQN(in_channels, num_actions).to(self.device)
         self.target_model.load_state_dict(self.model.state_dict())
         self.target_model.eval()
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
-        self.loss_fn = nn.SmoothL1Loss()
 
-        self.buffer = ReplayBuffer(buffer_size)
+        self.buffer = SequenceReplayBuffer(buffer_size, seq_len)
         self.steps = 0
+
+    def init_hidden(self, batch_size: int):
+        """Initialize LSTM hidden state for N environments."""
+        return self.model.init_hidden(batch_size, self.device)
 
     def select_actions_batched(
         self,
         states: torch.Tensor,
         action_masks: torch.Tensor,
-    ) -> torch.Tensor:
-        """Select actions for all N environments in one forward pass.
+        hidden,
+    ):
+        """Select actions for all N environments AND update LSTM hidden state.
+
+        Always runs the full forward pass on all envs to keep hidden states
+        current, then applies epsilon-greedy action selection.
 
         Args:
             states: (N, C, H, W) float32 tensor on device.
             action_masks: (N, 4) bool tensor — True = valid.
+            hidden: (h, c) tuple from previous step.
 
         Returns:
             actions: (N,) int64 tensor.
+            hidden: updated (h, c) tuple.
         """
         N = states.shape[0]
-        actions = torch.zeros(N, dtype=torch.int64, device=self.device)
 
-        # Determine which envs explore vs exploit
+        with torch.no_grad():
+            q_values, hidden = self.model(states, hidden)  # (N, 4), hidden
+
+        # Greedy actions with mask
+        q_masked = q_values.clone()
+        q_masked[~action_masks] = float('-inf')
+        actions = q_masked.argmax(dim=1)
+
+        # Exploration: random valid action for some envs
         explore_mask = torch.rand(N, device=self.device) < self.epsilon
-
-        # Exploration: random valid action
         if explore_mask.any():
-            # For each exploring env, pick a random valid action
             for i in torch.where(explore_mask)[0]:
                 valid = torch.where(action_masks[i])[0]
                 if len(valid) == 0:
                     valid = torch.arange(self.num_actions, device=self.device)
                 actions[i] = valid[torch.randint(len(valid), (1,), device=self.device)]
 
-        # Exploitation: greedy from Q-values
-        exploit_mask = ~explore_mask
-        if exploit_mask.any():
-            with torch.no_grad():
-                exploit_states = states[exploit_mask]
-                q_values = self.model(exploit_states)
-                # Mask invalid actions
-                exploit_action_masks = action_masks[exploit_mask]
-                q_values[~exploit_action_masks] = float('-inf')
-                exploit_actions = q_values.argmax(dim=1)
-                actions[exploit_mask] = exploit_actions
-
-        return actions
-
-    def store_transitions_batched(
-        self,
-        states: np.ndarray,
-        actions: np.ndarray,
-        rewards: np.ndarray,
-        next_states: np.ndarray,
-        dones: np.ndarray,
-    ) -> None:
-        """Add N transitions to the replay buffer at once."""
-        self.buffer.add_batch(states, actions, rewards, next_states, dones)
+        return actions, hidden
 
     def train_step(self) -> Optional[float]:
-        """Sample a batch and perform one gradient step (Double DQN)."""
-        if len(self.buffer) < self.batch_size:
+        """Sample a batch of sequences and perform one gradient step (Double DQN).
+
+        Forwards the full (L+1)-length state sequence through both online and
+        target models:
+          - Online at t=0..L-1 → Q(s_t) for current actions
+          - Online at t=1..L   → Q(s_{t+1}) for Double-DQN action selection
+          - Target at t=1..L   → Q_target(s_{t+1}) for value estimation
+        """
+        if len(self.buffer) < self.batch_size * self.seq_len:
             return None
 
-        states, actions, rewards, next_states, dones = self.buffer.sample(self.batch_size)
+        states_full, actions, rewards, dones, masks = self.buffer.sample(self.batch_size)
 
-        states_t = torch.from_numpy(states).to(self.device)
-        actions_t = torch.from_numpy(actions).to(self.device)
-        rewards_t = torch.from_numpy(rewards).to(self.device)
-        next_states_t = torch.from_numpy(next_states).to(self.device)
-        dones_t = torch.from_numpy(dones).to(self.device)
+        states_t = torch.from_numpy(states_full).to(self.device)   # (B, L+1, C, H, W)
+        actions_t = torch.from_numpy(actions).to(self.device)      # (B, L)
+        rewards_t = torch.from_numpy(rewards).to(self.device)      # (B, L)
+        dones_t = torch.from_numpy(dones).to(self.device)          # (B, L)
+        masks_t = torch.from_numpy(masks).to(self.device)          # (B, L)
 
-        # Current Q-values
-        q_values = self.model(states_t)
-        q_selected = q_values.gather(1, actions_t.unsqueeze(1)).squeeze(1)
+        # Forward online model through full sequence
+        q_all, _ = self.model(states_t)  # (B, L+1, num_actions)
+        q_current = q_all[:, :-1, :]                 # (B, L, num_actions)
+        q_next_online = q_all[:, 1:, :].detach()     # (B, L, num_actions)
 
-        # Double DQN target
+        # Forward target model (no grad)
         with torch.no_grad():
-            next_q_online = self.model(next_states_t)
-            best_actions = next_q_online.argmax(dim=1, keepdim=True)
-            next_q_target = self.target_model(next_states_t)
-            next_q = next_q_target.gather(1, best_actions).squeeze(1)
-            target = rewards_t + self.gamma * next_q * (1.0 - dones_t)
+            q_target_all, _ = self.target_model(states_t)
+            q_next_target = q_target_all[:, 1:, :]   # (B, L, num_actions)
 
-        loss = self.loss_fn(q_selected, target)
+        # Double DQN: online selects, target evaluates
+        q_selected = q_current.gather(2, actions_t.unsqueeze(2)).squeeze(2)  # (B, L)
+        best_next = q_next_online.argmax(dim=2)                              # (B, L)
+        next_q = q_next_target.gather(2, best_next.unsqueeze(2)).squeeze(2)  # (B, L)
+
+        # TD target
+        target = rewards_t + self.gamma * next_q * (1.0 - dones_t)
+
+        # Masked Huber loss
+        elementwise_loss = F.smooth_l1_loss(q_selected, target, reduction='none')
+        loss = (elementwise_loss * masks_t).sum() / masks_t.sum().clamp(min=1)
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -196,6 +206,8 @@ class BatchedPacmanAgent:
                 "optimizer": self.optimizer.state_dict(),
                 "epsilon": self.epsilon,
                 "steps": self.steps,
+                "seq_len": self.seq_len,
+                "arch": "drqn",
             },
             path,
         )
@@ -207,6 +219,42 @@ class BatchedPacmanAgent:
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.epsilon = checkpoint["epsilon"]
         self.steps = checkpoint["steps"]
+
+
+def _push_episodes_to_buffer(
+    buffer: SequenceReplayBuffer,
+    step_states: list,
+    step_actions: list,
+    step_rewards: list,
+    step_dones: list,
+    step_active: list,
+    n_envs: int,
+) -> None:
+    """Split per-step data by environment and push to sequence buffer.
+
+    Each env ran for a contiguous prefix of steps (active from step 0 until
+    done), producing an independent trajectory.
+    """
+    T = len(step_actions)
+    if T == 0:
+        return
+
+    # Number of active steps per env
+    active_all = np.stack(step_active)  # (T, N)
+    T_per_env = active_all.sum(axis=0).astype(np.int32)  # (N,)
+
+    for i in range(n_envs):
+        T_i = int(T_per_env[i])
+        if T_i < 1:
+            continue
+
+        # Extract per-env trajectory (list comprehension avoids stacking full arrays)
+        ep_states = np.stack([step_states[t][i] for t in range(T_i + 1)])
+        ep_actions = np.array([step_actions[t][i] for t in range(T_i)], dtype=np.int64)
+        ep_rewards = np.array([step_rewards[t][i] for t in range(T_i)], dtype=np.float32)
+        ep_dones = np.array([step_dones[t][i] for t in range(T_i)], dtype=np.float32)
+
+        buffer.add_episode(ep_states, ep_actions, ep_rewards, ep_dones)
 
 
 def train(
@@ -221,42 +269,35 @@ def train(
     eps_end: float = None,
     eps_decay: float = None,
     buffer_size: int = 200_000,
-    batch_size: int = 64,
-    target_update: int = 10_000,
+    batch_size: int = 32,
+    seq_len: int = 16,
+    target_update: int = 5_000,
     train_every: int = 4,
     no_reverse: bool = True,
     stage: int = 1,
 ) -> None:
-    """Train Pacman DQN agent using N parallel environments.
-
-    Args:
-        no_reverse: If True, mask the reverse of Pacman's current direction
-            using proximity-based logic: reverse is blocked unless a non-house
-            ghost is within Manhattan distance 4 (so the agent can flee).
-        stage: Curriculum stage (1=no ghosts, 2=Blinky slow, 3=Blinky fast,
-            4=Blinky+Pinky).
-    """
+    """Train Pacman DRQN agent using N parallel environments."""
 
     maze_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              os.pardir, "levels", "level_1.txt")
 
-    # Resolve device — model goes on GPU, game stays on CPU for throughput
+    # Resolve device
     if device == "auto":
         model_dev = _auto_device()
     else:
         model_dev = torch.device(device)
 
-    # Apply defaults for epsilon params (None means use defaults)
+    # Apply defaults for epsilon params
     _eps_start = eps_start if eps_start is not None else 0.5
-    _eps_end = eps_end if eps_end is not None else 0.01
+    _eps_end = eps_end if eps_end is not None else 0.05
     _eps_decay = eps_decay if eps_decay is not None else 0.99997
 
-    # Game engine always on CPU (14x faster than MPS for small integer ops)
+    # Game engine always on CPU
     game = BatchedGame(n_envs=n_envs, maze_file=maze_file, device="cpu")
     game.configure_stage(stage)
     total_pellets = game.maze.total_pellets
 
-    # Create agent (model on GPU)
+    # Create agent
     agent = BatchedPacmanAgent(
         in_channels=NUM_STATE_CHANNELS,
         num_actions=4,
@@ -267,9 +308,13 @@ def train(
         epsilon_decay=_eps_decay,
         buffer_size=buffer_size,
         batch_size=batch_size,
+        seq_len=seq_len,
         target_update_freq=target_update,
         device=str(model_dev),
     )
+
+    # Count params
+    n_params = sum(p.numel() for p in agent.model.parameters())
 
     # Resume
     os.makedirs(save_dir, exist_ok=True)
@@ -278,8 +323,6 @@ def train(
 
     if resume and os.path.exists(ckpt_path):
         agent.load(ckpt_path)
-        # Only override epsilon if user explicitly passed --eps-start
-        # Otherwise keep the checkpoint's epsilon value
         if eps_start is not None:
             agent.epsilon = eps_start
         if eps_end is not None:
@@ -294,10 +337,11 @@ def train(
     # Banner
     print()
     print("=" * 70)
-    print("  Vectorized Pac-Man — Batched DQN Training")
+    print("  Vectorized Pac-Man — Dueling DRQN Training (LSTM + Per-Ghost)")
     print("=" * 70)
     stage_desc = {1: "No ghosts", 2: "Blinky slow", 3: "Blinky fast", 4: "Blinky+Pinky slow",
-                  5: "3 ghosts slow", 6: "Blinky slow + Pinky fast", 7: "3 ghosts mixed"}
+                  5: "3 ghosts slow", 6: "4 ghosts slow", 7: "Blinky slow + Pinky fast",
+                  8: "3 ghosts mixed"}
     print(f"  Stage          : {stage} ({stage_desc.get(stage, '?')})")
     print(f"  Parallel envs  : {n_envs}")
     print(f"  Episodes       : {num_episodes} (starting from {start_episode})")
@@ -305,12 +349,15 @@ def train(
     print(f"  Model device   : {model_dev}")
     print(f"  LR             : {lr}")
     print(f"  Gamma          : {gamma}")
-    print(f"  Epsilon        : {_eps_start} -> {_eps_end} (decay {_eps_decay})")
+    print(f"  Epsilon        : {agent.epsilon:.4f} -> {_eps_end} (decay {_eps_decay})")
+    print(f"  Architecture   : Dueling DRQN, 9ch, Conv→512→LSTM(512)→Dueling")
+    print(f"  Parameters     : {n_params:,}")
+    print(f"  LSTM seq_len   : {seq_len}")
     print(f"  Batch size     : {batch_size}")
     print(f"  Buffer size    : {buffer_size:,}")
     print(f"  Target update  : every {target_update} steps")
     print(f"  Train every    : {train_every} game steps")
-    print(f"  Save schedule  : episodes 1-10 individually, then every 10")
+    print(f"  Save schedule  : episodes 1-10 individually, then every 75")
     print(f"  No-reverse     : {no_reverse} (anti-oscillation)")
     print(f"  Save dir       : {os.path.abspath(save_dir)}")
     if resume and start_episode > 0:
@@ -340,7 +387,6 @@ def train(
     all_scores = []
     all_rewards = []
     ep_win_rates = []
-    all_results = []
     recent_losses = []
     pac_wins = 0
     ghost_wins = 0
@@ -350,23 +396,21 @@ def train(
 
     t0 = time.time()
 
-    # Episode tracking per env
-    ep_rewards = np.zeros(n_envs, dtype=np.float32)
-    ep_steps = np.zeros(n_envs, dtype=np.int32)
-    episodes_completed = 0
-
-    # Get initial state
-    state = game.get_state()  # (N, 7, 31, 28) on device
-
     for episode in range(start_episode, start_episode + num_episodes):
         game.reset()
+        state = game.get_state()  # (N, C, H, W) tensor on CPU
+        hidden = agent.init_hidden(n_envs)
+
+        # Per-step data collection for episode buffer
+        step_states = [state.numpy().copy()]  # initial state for all envs
+        step_actions = []
+        step_rewards = []
+        step_dones = []
+        step_active = []
+
         ep_reward_total = 0.0
         ep_step_count = 0
         ep_t0 = time.time()
-        ep_rewards[:] = 0
-        ep_steps[:] = 0
-
-        state = game.get_state()
 
         while True:
             # Check if all envs are done
@@ -376,36 +420,33 @@ def train(
             if ep_step_count >= MAX_STEPS:
                 break
 
-            # Get action masks — proximity-based no-reverse handles per-env
-            # ghost distance checks internally (reverse allowed when ghost nearby)
-            action_masks = game.get_action_mask(no_reverse=no_reverse)  # (N, 4) bool, CPU
+            active = ~dones_all  # (N,) bool — envs still playing
 
-            # Transfer to model device for action selection, then back to CPU for stepping
-            actions = agent.select_actions_batched(
-                state.to(agent.device), action_masks.to(agent.device))
+            # Get action masks
+            action_masks = game.get_action_mask(no_reverse=no_reverse)
+
+            # Select actions (always forwards all envs to update LSTM hidden)
+            actions, hidden = agent.select_actions_batched(
+                state.to(agent.device), action_masks.to(agent.device), hidden)
             actions_cpu = actions.cpu()
 
-            # Step all environments (CPU)
+            # Step all environments
             rewards, dones, infos = game.step(actions_cpu)
 
             # Get next state
             next_state = game.get_state()
 
-            # Get clipped rewards
-            pac_rewards = game.get_reward_pacman()  # (N,) clipped to [-1, 1]
+            # Get rewards (unclipped — see README)
+            pac_rewards = game.get_reward_pacman()
 
-            # Store transitions for all active (non-done-before-step) environments
-            active_before = ~dones_all
-            if active_before.any():
-                active_idx = torch.where(active_before)[0]
-                s = state[active_idx].numpy()
-                a = actions_cpu[active_idx].numpy()
-                r = pac_rewards[active_idx].numpy()
-                ns = next_state[active_idx].numpy()
-                d = dones[active_idx].float().numpy()
-                agent.store_transitions_batched(s, a, r, ns, d)
+            # Record step data (copy because get_state uses double-buffered tensors)
+            step_states.append(next_state.numpy().copy())
+            step_actions.append(actions_cpu.numpy().copy())
+            step_rewards.append(pac_rewards.numpy().copy())
+            step_dones.append(dones.float().numpy().copy())
+            step_active.append(active.numpy().copy())
 
-            # Train
+            # Train on sequences from previous episodes
             if ep_step_count % train_every == 0:
                 loss = agent.train_step()
                 if loss is not None:
@@ -417,12 +458,11 @@ def train(
             total_game_steps += 1
             state = next_state
 
-            # Mid-episode progress (long episodes with no ghosts can take minutes)
+            # Mid-episode progress
             if ep_step_count % 500 == 0:
                 done_mask = game.game_over | game.level_complete
                 alive = (~done_mask).sum().item()
                 wins = game.level_complete.sum().item()
-                # Average pellets eaten across all envs
                 remaining = (game.pellets.sum(dim=(1, 2)) + game.power_pellets.sum(dim=(1, 2))).float()
                 avg_eaten = (total_pellets - remaining.mean()).item()
                 ep_elapsed = time.time() - ep_t0
@@ -432,13 +472,20 @@ def train(
                       f"{wins} won, {alive} playing | "
                       f"{sps:.0f} env-steps/s", flush=True)
 
-        # Episode results — aggregate across all N envs
+        # Push per-env trajectories to sequence replay buffer
+        _push_episodes_to_buffer(
+            agent.buffer, step_states, step_actions, step_rewards,
+            step_dones, step_active, n_envs)
+
+        # Free episode data
+        del step_states, step_actions, step_rewards, step_dones, step_active
+
+        # Episode results
         avg_score = game.score.float().mean().item()
         remaining_all = (game.pellets.sum(dim=(1, 2)) + game.power_pellets.sum(dim=(1, 2))).float()
         avg_pellets_eaten = int(total_pellets - remaining_all.mean().item())
 
         ep_pac_wins = game.level_complete.sum().item()
-        # game_over can include envs that also completed the level; exclude those
         ep_ghost_wins = (game.game_over & ~game.level_complete).sum().item()
         ep_timeouts = n_envs - ep_pac_wins - ep_ghost_wins
 
@@ -493,22 +540,19 @@ def train(
             recent_5_wr = ep_win_rates[-5:]
             avg_wr_5 = 100 * np.mean(recent_5_wr)
             overall_wr = 100 * pac_wins / total_games
-            # Visual win rate bar for last 5 episodes
             wr_bar = " ".join(f"{100*r:2.0f}%" for r in recent_5_wr)
             print(f"  >>> Last 5 win%: [{wr_bar}] avg {avg_wr_5:.0f}% | "
                   f"Overall {overall_wr:.0f}% ({pac_wins}W/{ghost_wins}L/{timeouts}TO) | "
                   f"Avg Score {np.mean(all_scores):.0f} | Best {best_score:.0f} | "
                   f"Avg R {np.mean(all_rewards):.1f} | "
-                  f"Buf {len(agent.buffer):,} | {sps:.0f} sps")
+                  f"Buf {len(agent.buffer):,} ({agent.buffer.num_episodes} eps) | {sps:.0f} sps")
 
-        # Save every 50 episodes
-        should_save = eps_done % 50 == 0
+        # Save: every episode for first 10, then every 25
+        should_save = eps_done <= 10 or eps_done % 25 == 0
         if should_save:
-            # Versioned checkpoint (never overwritten)
             tag = f"s{stage}_ep{ep_num}"
             versioned_path = os.path.join(save_dir, f"pacman_{tag}.pt")
             agent.save(versioned_path)
-            # Also save as latest (for --resume)
             agent.save(ckpt_path)
             np.save(os.path.join(save_dir, "meta.npy"), {"episode": ep_num, "stage": stage, "epsilon": agent.epsilon})
             print(f"\033[92m  >>> Saved: {os.path.basename(versioned_path)} (+ latest)\033[0m")
@@ -550,17 +594,18 @@ def train(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Batched DQN training for Pac-Man")
+    parser = argparse.ArgumentParser(description="Batched DRQN training for Pac-Man")
     parser.add_argument("--n-envs", type=int, default=16, help="Number of parallel environments")
     parser.add_argument("--episodes", type=int, default=5000, help="Number of episodes")
     parser.add_argument("--device", type=str, default="auto", help="Device (auto/cpu/mps/cuda)")
     parser.add_argument("--save-dir", type=str, default="checkpoints", help="Checkpoint directory")
     parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
     parser.add_argument("--lr", type=float, default=0.0001, help="Learning rate")
-    parser.add_argument("--batch-size", type=int, default=64, help="Training batch size")
-    parser.add_argument("--buffer-size", type=int, default=200_000, help="Replay buffer capacity")
+    parser.add_argument("--batch-size", type=int, default=32, help="Training batch size (sequences)")
+    parser.add_argument("--seq-len", type=int, default=16, help="LSTM sequence length for training")
+    parser.add_argument("--buffer-size", type=int, default=200_000, help="Replay buffer capacity (transitions)")
     parser.add_argument("--eps-start", type=float, default=None, help="Starting epsilon (default: 0.5)")
-    parser.add_argument("--eps-end", type=float, default=None, help="Final epsilon (default: 0.01)")
+    parser.add_argument("--eps-end", type=float, default=None, help="Final epsilon (default: 0.05)")
     parser.add_argument("--eps-decay", type=float, default=None, help="Epsilon decay per train step (default: 0.99997)")
     parser.add_argument("--no-reverse", action="store_true", default=True,
                         help="Anti-oscillation: proximity-based reverse masking (default: on)")
@@ -568,52 +613,27 @@ if __name__ == "__main__":
                         help="Disable no-reverse masking")
     parser.add_argument("--stage", type=int, default=1, choices=[1, 2, 3, 4, 5, 6, 7],
                         help="Curriculum stage (1=no ghosts, 2=Blinky slow, 3=Blinky fast, 4=B+P slow, 5=3 ghosts slow, 6=B slow+P fast, 7=3 ghosts mixed)")
-    parser.add_argument("--n-envs-bench", type=int, nargs="+", help="Benchmark mode: test throughput for these env counts")
     args = parser.parse_args()
     no_reverse = not args.allow_reverse
 
-    if args.n_envs_bench:
-        # Quick throughput benchmark
-        print("\n  Throughput Benchmark")
-        print("  " + "-" * 50)
-        maze_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                 os.pardir, "levels", "level_1.txt")
-        for n in args.n_envs_bench:
-            game = BatchedGame(n_envs=n, maze_file=maze_file, device="cpu")
-            actions = torch.randint(0, 4, (n,))
-            # Warmup
-            for _ in range(100):
-                game.step(actions)
-            # Timed run
-            t0 = time.time()
-            num_steps = 1000
-            for _ in range(num_steps):
-                rewards, dones, _ = game.step(actions)
-                done_mask = dones
-                if done_mask.any():
-                    game.reset(done_mask)
-            elapsed = time.time() - t0
-            sps = num_steps * n / elapsed
-            print(f"  n_envs={n:>4d}  |  {sps:>10,.0f} env-steps/sec  |  {elapsed:.2f}s for {num_steps} steps")
-        print()
-    else:
-        # Build kwargs, only passing epsilon overrides if specified
-        kwargs = dict(
-            n_envs=args.n_envs,
-            num_episodes=args.episodes,
-            save_dir=args.save_dir,
-            resume=args.resume,
-            device=args.device,
-            lr=args.lr,
-            batch_size=args.batch_size,
-            buffer_size=args.buffer_size,
-            no_reverse=no_reverse,
-            stage=args.stage,
-        )
-        if args.eps_start is not None:
-            kwargs["eps_start"] = args.eps_start
-        if args.eps_end is not None:
-            kwargs["eps_end"] = args.eps_end
-        if args.eps_decay is not None:
-            kwargs["eps_decay"] = args.eps_decay
-        train(**kwargs)
+    # Build kwargs
+    kwargs = dict(
+        n_envs=args.n_envs,
+        num_episodes=args.episodes,
+        save_dir=args.save_dir,
+        resume=args.resume,
+        device=args.device,
+        lr=args.lr,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        buffer_size=args.buffer_size,
+        no_reverse=no_reverse,
+        stage=args.stage,
+    )
+    if args.eps_start is not None:
+        kwargs["eps_start"] = args.eps_start
+    if args.eps_end is not None:
+        kwargs["eps_end"] = args.eps_end
+    if args.eps_decay is not None:
+        kwargs["eps_decay"] = args.eps_decay
+    train(**kwargs)

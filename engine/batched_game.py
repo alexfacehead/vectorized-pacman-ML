@@ -9,8 +9,9 @@ from .constants import (
     ROWS, COLS, ACTION_DIRS, READY_TIMER, MAX_STEPS,
     PELLET_SCORE, POWER_PELLET_SCORE,
     NUM_STATE_CHANNELS, CHANNEL_WALLS, CHANNEL_PELLETS,
-    CHANNEL_POWER_PELLETS, CHANNEL_PACMAN, CHANNEL_GHOSTS,
-    CHANNEL_FRIGHTENED, CHANNEL_VISITED,
+    CHANNEL_POWER_PELLETS, CHANNEL_PACMAN,
+    CHANNEL_BLINKY, CHANNEL_PINKY, CHANNEL_INKY, CHANNEL_CLYDE,
+    CHANNEL_VISITED, GHOST_CHANNELS,
     SCATTER, CHASE, FRIGHTENED, EATEN,
     GHOST_HOUSE_DOOR, GHOST_SCATTER_TARGETS,
 )
@@ -136,8 +137,9 @@ class BatchedGame:
         Stage 3: Blinky full speed (exit_timer=0, speed=1). Others frozen.
         Stage 4: Blinky + Pinky slow (both exit_timer=0, speed=2). Others frozen.
         Stage 5: Blinky + Pinky + Inky slow (all speed=2). Clyde frozen.
-        Stage 6: Blinky slow + Pinky fast (speed=2, speed=1). Others frozen.
-        Stage 7: 3 ghosts mixed (Blinky speed=2, Pinky speed=1, Inky speed=1). Clyde frozen.
+        Stage 6: All 4 ghosts slow (all speed=2).
+        Stage 7: Blinky slow + Pinky fast (speed=2, speed=1). Others frozen.
+        Stage 8: 3 ghosts mixed (Blinky speed=2, Pinky speed=1, Inky speed=1). Clyde frozen.
         """
         dev = self.device
         self._stage = stage
@@ -162,10 +164,14 @@ class BatchedGame:
                                                     dtype=torch.int32, device=dev)
             self._stage_speeds = torch.tensor([2, 2, 2, 3], dtype=torch.int32, device=dev)
         elif stage == 6:
+            self._stage_exit_timers = torch.tensor([0, 0, 0, 0],
+                                                    dtype=torch.int32, device=dev)
+            self._stage_speeds = torch.tensor([2, 2, 2, 2], dtype=torch.int32, device=dev)
+        elif stage == 7:
             self._stage_exit_timers = torch.tensor([0, 0, 999999, 999999],
                                                     dtype=torch.int32, device=dev)
             self._stage_speeds = torch.tensor([2, 1, 3, 3], dtype=torch.int32, device=dev)
-        elif stage == 7:
+        elif stage == 8:
             self._stage_exit_timers = torch.tensor([0, 0, 0, 999999],
                                                     dtype=torch.int32, device=dev)
             self._stage_speeds = torch.tensor([2, 1, 1, 3], dtype=torch.int32, device=dev)
@@ -219,7 +225,7 @@ class BatchedGame:
         )
         self.reward_pacman = self.reward_pacman + visit_penalty
 
-        # Direction-change penalty: soft anti-oscillation (-0.03 for changing action)
+        # Direction-change penalty: soft anti-oscillation
         has_prev = self.prev_action >= 0
         changed = actions.int() != self.prev_action
         dir_change_penalty = active & has_prev & changed
@@ -318,7 +324,7 @@ class BatchedGame:
             self.reward_pacman, self.reward_ghost, self.game_over,
         )
 
-        # --- Proximity reward (uses precomputed distances) ---
+        # --- Proximity reward ---
         prox_reward, self.prev_nearest_dist = proximity_reward(
             self.pacman_pos, self.pellets, self.power_pellets,
             self.maze.total_pellets, self.prev_nearest_dist,
@@ -334,6 +340,7 @@ class BatchedGame:
             self.pacman_pos, self.ghost_pos,
             self.ghost_in_house, ghost_is_frightened, ghost_is_eaten,
             active, self.game_over, self.level_complete,
+            self.dist_matrix, self.maze.tile_to_idx,
         )
         self.reward_pacman = self.reward_pacman + ghost_prox
 
@@ -401,8 +408,9 @@ class BatchedGame:
     def get_state(self) -> torch.Tensor:
         """Return observation tensors for all N environments.
 
-        Shape: (N, 7, ROWS, COLS) float32.
-        Channels: walls, pellets, power_pellets, pacman, ghosts, frightened, visited.
+        Shape: (N, 9, ROWS, COLS) float32.
+        Channels: walls, pellets, power_pellets, pacman, blinky, pinky, inky, clyde, visited.
+        Ghost channels: 1.0=dangerous, -1.0=frightened, 0.0=in house/absent/eaten.
 
         Uses a pre-allocated buffer to avoid allocation overhead.
         """
@@ -425,24 +433,26 @@ class BatchedGame:
         py = self.pacman_pos[:, 1].long()
         state[env_idx, CHANNEL_PACMAN, py, px] = 1.0
 
-        # 4-5: Ghost channels (clear then scatter)
-        state[:, CHANNEL_GHOSTS] = 0
-        state[:, CHANNEL_FRIGHTENED] = 0
+        # 4-7: Per-ghost channels (value encoding: 1.0=dangerous, -1.0=frightened, 0.0=in house/absent/eaten)
         for gi in range(4):
+            ch = GHOST_CHANNELS[gi]
+            state[:, ch] = 0
             gx = self.ghost_pos[:, gi, 0].long()
             gy = self.ghost_pos[:, gi, 1].long()
             gs = self.ghost_state[:, gi]
             in_house = self.ghost_in_house[:, gi]
 
+            # Dangerous (normal, out of house)
+            dangerous = (gs != FRIGHTENED) & (gs != EATEN) & ~in_house
+            if dangerous.any():
+                state[env_idx[dangerous], ch, gy[dangerous], gx[dangerous]] = 1.0
+
+            # Frightened (out of house)
             frightened = (gs == FRIGHTENED) & ~in_house
-            normal = (gs != FRIGHTENED) & (gs != EATEN) & ~in_house
-
             if frightened.any():
-                state[env_idx[frightened], CHANNEL_FRIGHTENED, gy[frightened], gx[frightened]] = 1.0
-            if normal.any():
-                state[env_idx[normal], CHANNEL_GHOSTS, gy[normal], gx[normal]] = 1.0
+                state[env_idx[frightened], ch, gy[frightened], gx[frightened]] = -1.0
 
-        # 6: Visit heatmap
+        # 8: Visit heatmap
         state[:, CHANNEL_VISITED] = self.visit_map
 
         return state

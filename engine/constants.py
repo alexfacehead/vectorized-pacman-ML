@@ -64,12 +64,18 @@ GHOST_SCATTER_TARGETS = torch.tensor([
 # Episode limits
 MAX_STEPS = 3500
 
-# State channels
+# State channels — per-ghost encoding
+# Ghost channels use value encoding: 1.0 = dangerous, -1.0 = frightened, 0.0 = in house/absent
 CHANNEL_WALLS = 0
 CHANNEL_PELLETS = 1
 CHANNEL_POWER_PELLETS = 2
 CHANNEL_PACMAN = 3
-CHANNEL_GHOSTS = 4
-CHANNEL_FRIGHTENED = 5
-CHANNEL_VISITED = 6
-NUM_STATE_CHANNELS = 7
+CHANNEL_BLINKY = 4
+CHANNEL_PINKY = 5
+CHANNEL_INKY = 6
+CHANNEL_CLYDE = 7
+CHANNEL_VISITED = 8
+NUM_STATE_CHANNELS = 9
+
+# Ghost channel indices (maps ghost index 0-3 to state channel)
+GHOST_CHANNELS = [CHANNEL_BLINKY, CHANNEL_PINKY, CHANNEL_INKY, CHANNEL_CLYDE]
