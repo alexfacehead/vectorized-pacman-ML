@@ -7,7 +7,7 @@ Inspired by [DeepMind's original DQN work](https://www.nature.com/articles/natur
 <p align="center">
   <img src="assets/pacman-dqn-demo.gif" alt="DRQN agent playing Pac-Man against 4 ghosts" width="400">
   <br>
-  <em>DRQN agent vs. 4 ghosts (all at half speed) — 77.7% win rate evaluated over 2,048 games at greedy policy (epsilon = 0). Trained in ~205,000 games across a 6-stage curriculum on Apple Silicon.</em>
+  <em>DRQN agent vs. 4 ghosts (all at half speed) — 84.2% win rate evaluated over 3,072 games at greedy policy (epsilon = 0). Trained in ~243,000 games across a 6-stage curriculum on Apple Silicon.</em>
 </p>
 
 ## Results
@@ -19,9 +19,9 @@ All eval win rates measured at epsilon = 0 (pure greedy policy) over 512+ games 
 | 1 | None | -- | 225 | 100% |
 | 2 | Blinky | 50% | 150 | 90%+ |
 | 5 | Blinky + Pinky + Inky | 50% | 428 | 83% |
-| 6 | All 4 ghosts | 50% | 800 | **77.7%** (n=2048) |
+| 6 | All 4 ghosts | 50% | 1,900 | **84.2%** (n=3072) |
 
-**Total: ~1,600 episodes / ~205,000 games.** Each episode = 128 parallel games.
+**Total: ~1,900 episodes / ~243,000 games.** Each episode = 128 parallel games.
 
 ### Key Milestone: No-Reverse Mask Removed
 
@@ -72,6 +72,15 @@ Per-ghost channels (vs. a single shared ghost channel) enable the LSTM to learn 
 ### Vectorized Engine
 
 Instead of training on one game at a time, the engine runs **128 games simultaneously** using batched tensor operations. Each game step produces 128 transitions, yielding ~2,800 env-steps/sec throughput.
+
+### Prioritized Experience Replay (PER)
+
+The replay buffer uses episode-level prioritized sampling based on max TD error per sequence. Episodes where the model's predictions were furthest off (i.e., the hardest games) are replayed more frequently. This replaced uniform sampling and was responsible for the jump from 78% to 84% eval win rate — the model was always capable, but uniform sampling wasted training cycles on easy games the agent had already mastered.
+
+Key PER details:
+- **Proportional sampling** with alpha = 0.6 (controls how much prioritization vs. uniform)
+- **Importance-sampling weights** with beta annealing 0.4 → 1.0 (corrects for sampling bias)
+- **Episode-level priorities** updated after each training step using max TD error across the sequence
 
 ### Sequence Replay Buffer
 
@@ -182,6 +191,10 @@ Requires the [PacmanML](https://github.com/alexhugli/PacmanML) renderer installe
 - **No-reverse mask with DQN**: required as a crutch to prevent pathological oscillation. Worked, but constrained the action space artificially.
 - **Manhattan distance for ghost proximity**: caused phantom penalties through walls, teaching the agent to fear ghosts in adjacent corridors it couldn't reach. Replaced with BFS distance.
 - **Sequence length 16 with 4 ghosts**: adequate for 1-3 ghosts, but 4 ghosts cover enough of the maze that longer planning horizons (seq_len 32) were needed to anticipate traps.
+- **Sequence length 64**: diluted training signal with irrelevant ancient history, degrading eval from 78% to 70.6%. The sweet spot is 32.
+- **Self-attention after LSTM**: catastrophic failure. LayerNorm reshapes feature distributions the dueling heads expect. Even a gated residual (gate=0.01) with LayerNorm removed only delayed collapse — attention gradually corrupted the policy over hundreds of episodes. Dead end without training from scratch.
+- **Reward tuning (ghost proximity)**: reducing ghost proximity penalty from -0.075/radius 4 to -0.04/radius 3 showed no improvement. The original values were already well-calibrated.
+- **Epsilon floor 0.02**: caused overfitting within ~75 episodes. The buffer became too homogeneous with the model replaying its own near-greedy trajectories. 0.05 is the safe floor.
 
 ### Breakthroughs
 
@@ -190,12 +203,15 @@ Requires the [PacmanML](https://github.com/alexhugli/PacmanML) renderer installe
 3. **Per-ghost state channels**: allowed the network to learn ghost-specific evasion strategies and enabled clean weight transfer during curriculum transitions.
 4. **BFS ghost proximity**: accurate distance signal through maze topology, replacing misleading Manhattan distance.
 5. **Curriculum learning with epsilon resets**: each stage inherits a strong prior from the previous stage, requiring only moderate exploration to adapt to new threats.
+6. **Prioritized Experience Replay**: the single biggest post-architecture improvement. By replaying the hardest episodes more frequently, the model focused on its weaknesses instead of coasting on easy games. Responsible for a 6+ point eval improvement (78% → 84.2%).
 
 ### LSTM Phase Transition
 
 A distinctive pattern emerged across all stages: the LSTM exhibits a "phase transition" where performance suddenly accelerates as epsilon drops. At high epsilon, random actions corrupt the LSTM's hidden state, preventing coherent temporal reasoning. As epsilon falls below ~0.15, the agent gets enough consecutive coherent actions for the hidden state to build meaningful context, creating a feedback loop: cleaner sequences -> better temporal reasoning -> better Q-values -> even better sequences.
 
 Stage 5 (3 ghosts) progression: 0% (ep 376) -> 6% (ep 480) -> 27% (ep 525) -> 51% (ep 575) -> 83% eval (ep 800).
+
+Stage 6 (4 ghosts) progression: 0-1% (ep 426) -> 6% (ep 480) -> 58% (ep 526) -> 78% (ep 1600, uniform replay) -> **84.2%** (ep 1900, prioritized replay).
 
 ## Future Work
 
